@@ -38,10 +38,19 @@ open build/Build/Products/Debug/TVExtend.app
 The app lives in the menu bar (TV icon). On first start, macOS asks for Screen Recording
 permission: allow it, quit the app and open it again.
 
-**Using it:** open TV Extend on the TV, then choose **Connect to TV…** (menu-bar icon, Dock
-icon right-click, or the app menu) and enter the address the TV shows. A new display named
+**Using it:** open TV Extend on the TV. On the Mac, the TV appears by name under **TVs on Your
+Network** (menu-bar icon, Dock icon right-click, or the app menu); click it. A display named
 after your TV appears; arrange it in System Settings → Displays. **Disconnect** removes it.
-The first connection also triggers macOS's Local Network permission prompt.
+If the TV isn't listed (some routers block Bonjour), use **Connect by IP Address…** with the
+address the TV shows.
+
+- **Reconnects automatically:** if Wi-Fi drops or the TV app restarts, the display stays put
+  for up to a minute while it reconnects, so your windows don't jump back to the Mac.
+- **Connect Automatically** (on by default): connects to the last TV whenever it appears.
+- **Display Size:** Default (1920×1080), or Larger/Largest Text (HiDPI, looks like
+  1280×720 or 960×540) for reading from the couch. **Video Quality:** 10/20/30 Mbps.
+- **Launch at Login:** registers the app where it currently is, so copy `TVExtend.app` to
+  `/Applications` first.
 
 **Save Debug Recording** (off by default) also writes each session to `~/Movies/TV Extend/`:
 a `.mov` for QuickTime and the raw `.h264` stream used by `tools/sendfile`.

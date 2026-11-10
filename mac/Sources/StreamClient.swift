@@ -18,8 +18,8 @@ enum StreamError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .unreachable(let host):
-            "Couldn't reach the TV at \(host). Check that the TV Extend app is open on the TV, and that "
+        case .unreachable(let tv):
+            "Couldn't reach \(tv). Check that the TV Extend app is open on the TV, and that "
                 + "this Mac app is allowed under System Settings → Privacy & Security → Local Network."
         case .rejected: "The TV app rejected the connection. Make sure both apps are up to date."
         case .badMessage: "The TV sent something unexpected."
@@ -65,7 +65,8 @@ final class StreamClient {
     /// Called once, on the network queue, when the connection ends for any reason.
     var onDisconnect: ((String) -> Void)?
 
-    let host: String
+    /// Human-readable name of the TV for messages ("Living Room TV" or "192.168.1.42").
+    let label: String
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "tvextend.network", qos: .userInteractive)
 
@@ -76,6 +77,7 @@ final class StreamClient {
     private var keyframeAsked = false
     private var pingTimer: DispatchSourceTimer?
     private var lastPongAt = DispatchTime.now()
+    private var handshakeDone = false
 
     // Stats, read from the main thread.
     private let statsLock = NSLock()
@@ -87,24 +89,37 @@ final class StreamClient {
     var framesDropped: Int { statsLock.withLock { _framesDropped } }
     var roundTripMs: Double? { statsLock.withLock { _roundTripMs } }
 
-    init(host: String) {
-        self.host = host
+    /// Connect to a Bonjour service or a host:port endpoint.
+    init(endpoint: NWEndpoint, label: String) {
+        self.label = label
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: tcp)
         parameters.serviceClass = .interactiveVideo
-        connection = NWConnection(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: Self.port)!,
-            using: parameters
+        connection = NWConnection(to: endpoint, using: parameters)
+    }
+
+    convenience init(host: String) {
+        self.init(
+            endpoint: .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: Self.port)!),
+            label: host
         )
     }
+
+    /// True once the connection has ended (any thread).
+    var isClosed: Bool { queue.sync { closed } }
 
     // MARK: Connecting
 
     /// Opens the connection and does the HELLO handshake.
-    func connect(width: Int, height: Int, fps: Int) async throws -> TVInfo {
-        try await waitUntilReady(timeout: 8)
+    func connect(width: Int, height: Int, fps: Int, timeout: TimeInterval = 8) async throws -> TVInfo {
+        try await waitUntilReady(timeout: timeout)
+
+        // If the TV accepts the TCP connection but never answers, give up.
+        queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            guard let self, !self.handshakeDone else { return }
+            self.close(reason: "\(self.label) didn't answer.")
+        }
 
         let hello = try JSONSerialization.data(withJSONObject: [
             "version": 1, "codec": "avc", "width": width, "height": height, "fps": fps,
@@ -112,6 +127,7 @@ final class StreamClient {
         queue.async { self.sendMessage(.hello, payload: hello) }
 
         let reply = try await nextMessage()
+        queue.sync { handshakeDone = true }
         guard reply.type == MessageType.helloAck.rawValue else { throw StreamError.rejected }
         let info = try JSONDecoder().decode(TVInfo.self, from: reply.payload)
 
@@ -144,7 +160,7 @@ final class StreamClient {
                         }
                     }
                 case .failed:
-                    finish(StreamError.unreachable(self?.host ?? "?"))
+                    finish(StreamError.unreachable(self?.label ?? "the TV"))
                 case .cancelled:
                     finish(StreamError.closed("Cancelled."))
                 default:
@@ -154,7 +170,7 @@ final class StreamClient {
             queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
                 guard !finished else { return }
                 self?.connection.cancel()
-                finish(StreamError.unreachable(self?.host ?? "?"))
+                finish(StreamError.unreachable(self?.label ?? "the TV"))
             }
             connection.start(queue: queue)
         }

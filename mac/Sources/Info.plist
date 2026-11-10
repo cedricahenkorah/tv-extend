@@ -22,6 +22,10 @@
 	<string>1</string>
 	<key>LSUIElement</key>
 	<false/>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_tvextend._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>TV Extend streams the virtual display to your TV on the local network.</string>
 	<key>NSScreenCaptureUsageDescription</key>

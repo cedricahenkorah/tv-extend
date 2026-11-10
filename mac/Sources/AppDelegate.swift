@@ -1,43 +1,66 @@
 import AppKit
+import Network
+import ServiceManagement
 
-/// Menu-bar + Dock UI and the streaming session.
+/// Menu-bar + Dock UI and the connection lifecycle.
 ///
-/// Connect flow: reach the TV first (so nothing flickers if it's unreachable), then create
-/// the virtual display, capture it, encode it and send every frame to the TV.
+/// - TVs running the TV app are discovered over Bonjour and listed by name.
+/// - If the connection drops, the virtual display stays up while we reconnect (for up to
+///   a minute), so windows on the TV don't jump back to the Mac.
+/// - With "Connect Automatically", the last TV is connected as soon as it appears.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    /// Where to connect: a discovered TV, or an address typed by hand.
+    private enum Target: Equatable {
+        case bonjour(serviceName: String, displayName: String)
+        case host(String)
+
+        var label: String {
+            switch self {
+            case .bonjour(_, let name): name
+            case .host(let host): host
+            }
+        }
+
+        var endpoint: NWEndpoint {
+            switch self {
+            case .bonjour(let serviceName, _):
+                .service(name: serviceName, type: TVBrowser.serviceType, domain: "local.", interface: nil)
+            case .host(let host):
+                .hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: StreamClient.port)!)
+            }
+        }
+    }
+
     private enum State: Equatable {
         case idle
-        case connecting(host: String)
-        case streaming(tvName: String)
+        case connecting(Target)
+        case streaming(Target, tvName: String)
+        case reconnecting(Target, tvName: String, since: Date)
         case stopping
     }
 
-    // Stream settings. These become user settings in Phase 5.
-    private let width = 1920
-    private let height = 1080
-    private let fps = 60
-    private let bitrate = 20_000_000
+    private static let reconnectWindow: TimeInterval = 60
 
     private var statusItem: NSStatusItem!
+    private let browser = TVBrowser()
+    private var discovered: [DiscoveredTV] = []
+
     private var state = State.idle
     private var lastMessage: String?
+    /// Set when the user disconnects, so auto-connect doesn't immediately reconnect.
+    /// Cleared when that TV leaves the network (e.g. the TV app is closed).
+    private var suppressAutoConnect = false
 
-    // Session objects (alive while connecting/streaming).
+    private var session: DisplaySession?
     private var client: StreamClient?
-    private var display: VirtualDisplay?
-    private var capturer: ScreenCapturer?
-    private var encoder: VideoEncoder?
-    private var recorder: Recorder?
+    private var pendingClient: StreamClient?
+    private var retryTask: Task<Void, Never>?
+    private var isRetrying = false
 
-    // Stats.
     private var statsTimer: Timer?
     private var lastBytesSent = 0
     private var bitrateMbps = 0.0
-
-    private let defaults = UserDefaults.standard
-    private let lastHostKey = "lastTVHost"
-    private let debugRecordingKey = "saveDebugRecording"
 
     private let recordingsDirectory = FileManager.default
         .urls(for: .moviesDirectory, in: .userDomainMask)[0]
@@ -48,7 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let statusMenu = NSMenu()
-        statusMenu.delegate = self // rebuilt every time it opens
+        statusMenu.delegate = self
         statusItem.menu = statusMenu
 
         let appMenu = NSMenu()
@@ -59,16 +82,181 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainMenu.addItem(appItem)
         NSApp.mainMenu = mainMenu
 
+        browser.onChange = { [weak self] tvs in self?.discoveredTVsChanged(tvs) }
+        browser.start()
         updateIcon()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard client != nil else { return .terminateNow }
+        guard session != nil || client != nil || pendingClient != nil else { return .terminateNow }
         Task {
-            await stopSession()
+            await tearDown(message: nil)
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
+    }
+
+    // MARK: Discovery & auto-connect
+
+    private func discoveredTVsChanged(_ tvs: [DiscoveredTV]) {
+        discovered = tvs
+        let lastName = Settings.lastServiceName
+        let lastTVPresent = lastName.map { name in tvs.contains { $0.serviceName == name } } ?? false
+
+        if suppressAutoConnect && !lastTVPresent {
+            suppressAutoConnect = false
+        }
+
+        switch state {
+        case .idle where Settings.autoConnect && !suppressAutoConnect && lastTVPresent:
+            if let tv = tvs.first(where: { $0.serviceName == lastName }) {
+                connect(to: .bonjour(serviceName: tv.serviceName, displayName: tv.displayName), userInitiated: false)
+            }
+        case .reconnecting(.bonjour(let serviceName, _), _, _) where tvs.contains(where: { $0.serviceName == serviceName }):
+            scheduleRetry(after: 0) // the TV is back; don't wait for the next retry tick
+        default:
+            break
+        }
+    }
+
+    // MARK: Connecting
+
+    private func connect(to target: Target, userInitiated: Bool) {
+        guard state == .idle else { return }
+        lastMessage = nil
+        switch target {
+        case .bonjour(let serviceName, _): Settings.lastServiceName = serviceName
+        case .host(let host): Settings.lastHost = host
+        }
+        setState(.connecting(target))
+        Task { await startSession(target, userInitiated: userInitiated) }
+    }
+
+    private func startSession(_ target: Target, userInitiated: Bool) async {
+        do {
+            let (client, tv) = try await openClient(target, timeout: 8)
+            guard state == .connecting(target) else { client.disconnect(); return }
+
+            let session = try await DisplaySession.start(
+                name: tv.name,
+                size: Settings.displaySize,
+                bitrateMbps: Settings.bitrateMbps,
+                recordTo: Settings.saveDebugRecording ? recordingsDirectory : nil
+            )
+            guard state == .connecting(target) else {
+                await session.stop()
+                client.disconnect()
+                return
+            }
+            session.onCaptureError = { [weak self] error in
+                guard let self else { return }
+                Task { await self.tearDown(message: "Capture stopped: \(error.localizedDescription)") }
+            }
+            self.session = session
+            setState(.streaming(target, tvName: tv.name))
+            attach(client)
+        } catch {
+            guard state == .connecting(target) else { return } // user cancelled
+            setState(.idle)
+            if userInitiated {
+                showError(error)
+            } else {
+                lastMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func openClient(_ target: Target, timeout: TimeInterval) async throws -> (StreamClient, TVInfo) {
+        let client = StreamClient(endpoint: target.endpoint, label: target.label)
+        pendingClient = client
+        defer { if pendingClient === client { pendingClient = nil } }
+        let info = try await client.connect(
+            width: Settings.streamWidth, height: Settings.streamHeight, fps: Settings.fps, timeout: timeout
+        )
+        return (client, info)
+    }
+
+    private func attach(_ client: StreamClient) {
+        self.client = client
+        client.onDisconnect = { [weak self, weak client] reason in
+            Task { @MainActor in
+                guard let self, let client else { return }
+                self.clientLost(client, reason: reason)
+            }
+        }
+        if client.isClosed {
+            clientLost(client, reason: "Connection lost.")
+            return
+        }
+        session?.client = client
+    }
+
+    // MARK: Reconnecting
+
+    private func clientLost(_ lost: StreamClient, reason: String) {
+        guard lost === client else { return }
+        client = nil
+        session?.client = nil
+        guard case .streaming(let target, let name) = state else { return }
+        NSLog("[app] connection to %@ lost (%@); reconnecting", name, reason)
+        setState(.reconnecting(target, tvName: name, since: Date()))
+        scheduleRetry(after: 1)
+    }
+
+    private func scheduleRetry(after seconds: Double) {
+        guard !isRetrying else { return }
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            if seconds > 0 { try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000)) }
+            guard !Task.isCancelled else { return }
+            await self?.retry()
+        }
+    }
+
+    private func retry() async {
+        guard case .reconnecting(let target, let name, let since) = state else { return }
+        if Date().timeIntervalSince(since) > Self.reconnectWindow {
+            await tearDown(message: "Lost connection to \(name).")
+            return
+        }
+
+        isRetrying = true
+        defer { isRetrying = false }
+        do {
+            let (client, _) = try await openClient(target, timeout: 4)
+            guard state == .reconnecting(target, tvName: name, since: since) else {
+                client.disconnect()
+                return
+            }
+            NSLog("[app] reconnected to %@", name)
+            setState(.streaming(target, tvName: name))
+            attach(client)
+        } catch {
+            guard case .reconnecting = state else { return }
+            isRetrying = false
+            scheduleRetry(after: 2)
+        }
+    }
+
+    // MARK: Disconnecting
+
+    private func tearDown(message: String?) async {
+        guard state != .stopping else { return }
+        retryTask?.cancel()
+        retryTask = nil
+        setState(.stopping)
+
+        pendingClient?.disconnect()
+        pendingClient = nil
+        let client = self.client
+        let session = self.session
+        self.client = nil
+        self.session = nil
+
+        await session?.stop() // removes the virtual display
+        client?.disconnect()
+        lastMessage = message
+        setState(.idle)
     }
 
     // MARK: Menus (status item, app menu and Dock menu share one builder)
@@ -80,42 +268,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
         let menu = NSMenu()
-        menu.autoenablesItems = false
-        // macOS adds its own Quit to the Dock menu.
-        for item in makeMenuItems(includeQuit: false) { menu.addItem(item) }
+        for item in makeMenuItems(includeQuit: false) { menu.addItem(item) } // macOS adds Quit
         return menu
     }
 
     private func makeMenuItems(includeQuit: Bool = true) -> [NSMenuItem] {
         var items: [NSMenuItem] = []
+        items.append(label(statusText()))
+        if let lastMessage, state == .idle { items.append(label(lastMessage)) }
+        items.append(.separator())
 
-        let status = NSMenuItem(title: statusText(), action: nil, keyEquivalent: "")
-        status.isEnabled = false
-        items.append(status)
-        if let lastMessage, state == .idle {
-            let message = NSMenuItem(title: lastMessage, action: nil, keyEquivalent: "")
-            message.isEnabled = false
-            items.append(message)
+        // TVs
+        items.append(label("TVs on Your Network"))
+        let currentTarget = currentTargetServiceName()
+        for tv in discovered {
+            let item = action(tv.displayName, #selector(connectToDiscoveredTV(_:)))
+            item.representedObject = tv.serviceName
+            item.indentationLevel = 1
+            item.state = tv.serviceName == currentTarget ? .on : .off
+            item.isEnabled = state == .idle
+            items.append(item)
         }
-        items.append(.separator())
-
-        let connect = item("Connect to TV…", #selector(connectToTV), "k")
-        connect.isEnabled = state == .idle
-        items.append(connect)
-
-        let disconnect = item("Disconnect", #selector(disconnect), "d")
-        disconnect.isEnabled = {
-            if case .streaming = state { return true }
-            if case .connecting = state { return true }
-            return false
-        }()
+        if discovered.isEmpty {
+            let none = label("None found. Open TV Extend on your TV.")
+            none.indentationLevel = 1
+            items.append(none)
+        }
+        let byIP = action("Connect by IP Address…", #selector(connectByIP))
+        byIP.isEnabled = state == .idle
+        items.append(byIP)
+        let disconnect = action("Disconnect", #selector(disconnect))
+        disconnect.isEnabled = state != .idle && state != .stopping
         items.append(disconnect)
-
         items.append(.separator())
-        let recording = item("Save Debug Recording", #selector(toggleDebugRecording), "")
-        recording.state = defaults.bool(forKey: debugRecordingKey) ? .on : .off
+
+        // Settings
+        items.append(submenu("Display Size", DisplaySize.allCases.map { size in
+            let item = action(size.title, #selector(chooseDisplaySize(_:)))
+            item.representedObject = size.rawValue
+            item.state = Settings.displaySize == size ? .on : .off
+            return item
+        } + [.separator(), label("Applies the next time you connect")]))
+
+        items.append(submenu("Video Quality", Settings.bitrateChoices.map { mbps in
+            let suffix = mbps == 10 ? " (lighter on Wi-Fi)" : mbps == 20 ? " (default)" : " (sharpest)"
+            let item = action("\(mbps) Mbps\(suffix)", #selector(chooseBitrate(_:)))
+            item.representedObject = mbps
+            item.state = Settings.bitrateMbps == mbps ? .on : .off
+            return item
+        } + [.separator(), label("Applies the next time you connect")]))
+
+        let auto = action("Connect Automatically", #selector(toggleAutoConnect))
+        auto.state = Settings.autoConnect ? .on : .off
+        items.append(auto)
+        let login = action("Launch at Login", #selector(toggleLaunchAtLogin))
+        login.state = Settings.launchAtLogin ? .on : .off
+        items.append(login)
+        items.append(.separator())
+
+        // Debugging
+        let recording = action("Save Debug Recording", #selector(toggleDebugRecording))
+        recording.state = Settings.saveDebugRecording ? .on : .off
         items.append(recording)
-        items.append(item("Show Recordings in Finder", #selector(revealRecordings), ""))
+        items.append(action("Show Recordings in Finder", #selector(revealRecordings)))
 
         if includeQuit {
             items.append(.separator())
@@ -124,21 +339,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return items
     }
 
-    private func item(_ title: String, _ action: Selector, _ key: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+    private func label(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func action(_ title: String, _ selector: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: "")
         item.target = self
         return item
+    }
+
+    private func submenu(_ title: String, _ children: [NSMenuItem]) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let menu = NSMenu()
+        children.forEach(menu.addItem)
+        item.submenu = menu
+        return item
+    }
+
+    private func currentTargetServiceName() -> String? {
+        switch state {
+        case .connecting(.bonjour(let name, _)), .streaming(.bonjour(let name, _), _),
+             .reconnecting(.bonjour(let name, _), _, _):
+            name
+        default:
+            nil
+        }
     }
 
     private func statusText() -> String {
         switch state {
         case .idle:
             return "Not connected"
-        case .connecting(let host):
-            return "Connecting to \(host)…"
+        case .connecting(let target):
+            return "Connecting to \(target.label)…"
+        case .reconnecting(_, let name, _):
+            return "Reconnecting to \(name)…"
         case .stopping:
             return "Disconnecting…"
-        case .streaming(let name):
+        case .streaming(_, let name):
             var parts = ["Streaming to \(name)"]
             if let rtt = client?.roundTripMs { parts.append(String(format: "%.0f ms", rtt)) }
             parts.append(String(format: "%.1f Mbps", bitrateMbps))
@@ -149,21 +390,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Actions
 
-    @objc private func connectToTV() {
+    // Menu actions can't be enabled/disabled per-state on the Dock menu reliably, so each
+    // action re-checks the state.
+
+    @objc private func connectToDiscoveredTV(_ sender: NSMenuItem) {
+        guard let serviceName = sender.representedObject as? String,
+              let tv = discovered.first(where: { $0.serviceName == serviceName }) else { return }
+        suppressAutoConnect = false
+        connect(to: .bonjour(serviceName: tv.serviceName, displayName: tv.displayName), userInitiated: true)
+    }
+
+    @objc private func connectByIP() {
         guard state == .idle, let host = askForHost() else { return }
-        defaults.set(host, forKey: lastHostKey)
-        lastMessage = nil
-        setState(.connecting(host: host))
-        Task { await startSession(host: host) }
+        suppressAutoConnect = false
+        connect(to: .host(host), userInitiated: true)
     }
 
     @objc private func disconnect() {
         guard state != .idle, state != .stopping else { return }
-        Task { await stopSession() }
+        suppressAutoConnect = true
+        Task { await tearDown(message: nil) }
+    }
+
+    @objc private func chooseDisplaySize(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let size = DisplaySize(rawValue: raw) {
+            Settings.displaySize = size
+        }
+    }
+
+    @objc private func chooseBitrate(_ sender: NSMenuItem) {
+        if let mbps = sender.representedObject as? Int { Settings.bitrateMbps = mbps }
+    }
+
+    @objc private func toggleAutoConnect() {
+        Settings.autoConnect.toggle()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        do {
+            try Settings.setLaunchAtLogin(!Settings.launchAtLogin)
+            if Settings.launchAtLoginNeedsApproval {
+                SMAppService.openSystemSettingsLoginItems()
+            }
+        } catch {
+            showError(error, title: "Couldn't change Launch at Login")
+        }
     }
 
     @objc private func toggleDebugRecording() {
-        defaults.set(!defaults.bool(forKey: debugRecordingKey), forKey: debugRecordingKey)
+        Settings.saveDebugRecording.toggle()
     }
 
     @objc private func revealRecordings() {
@@ -173,11 +448,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func askForHost() -> String? {
         let alert = NSAlert()
-        alert.messageText = "Connect to TV"
-        alert.informativeText = "Open TV Extend on the TV and enter the address it shows (the port is optional)."
+        alert.messageText = "Connect by IP Address"
+        alert.informativeText = "Enter the address shown on the TV (the port is optional)."
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         field.placeholderString = "192.168.1.42"
-        field.stringValue = defaults.string(forKey: lastHostKey) ?? ""
+        field.stringValue = Settings.lastHost ?? ""
         alert.accessoryView = field
         alert.addButton(withTitle: "Connect")
         alert.addButton(withTitle: "Cancel")
@@ -185,91 +460,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
 
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        // Accept "1.2.3.4" or "1.2.3.4:48100".
         let host = field.stringValue.trimmingCharacters(in: .whitespaces)
             .split(separator: ":").first.map(String.init) ?? ""
         return host.isEmpty ? nil : host
     }
 
-    // MARK: Session
-
-    private func startSession(host: String) async {
-        let client = StreamClient(host: host)
-        self.client = client
-        client.onDisconnect = { [weak self] reason in
-            Task { @MainActor in self?.connectionEnded(reason) }
-        }
-
-        do {
-            let tv = try await client.connect(width: width, height: height, fps: fps)
-            guard self.client === client else { return } // cancelled while connecting
-
-            let display = try VirtualDisplay(name: tv.name, width: width, height: height, refreshRate: Double(fps))
-            let encoder = try VideoEncoder(width: width, height: height, fps: fps, bitrate: bitrate)
-            let capturer = ScreenCapturer()
-            let recorder = defaults.bool(forKey: debugRecordingKey) ? try Recorder(directory: recordingsDirectory) : nil
-
-            encoder.onFrame = { frame in
-                client.send(frame)
-                recorder?.write(frame)
-            }
-            capturer.onFrame = { pixelBuffer, pts in encoder.encode(pixelBuffer, pts: pts) }
-            capturer.onError = { [weak self] error in
-                Task { @MainActor in self?.connectionEnded("Capture stopped: \(error.localizedDescription)") }
-            }
-            client.onKeyframeRequest = { [weak encoder, weak capturer] in
-                encoder?.requestKeyframe()
-                capturer?.resendLastFrame() // in case the screen is idle
-            }
-
-            self.display = display
-            self.encoder = encoder
-            self.capturer = capturer
-            self.recorder = recorder
-
-            try await capturer.start(displayID: display.displayID, width: width, height: height, fps: fps)
-            setState(.streaming(tvName: tv.name))
-        } catch {
-            guard self.client === client else { return } // user pressed Disconnect; no error to show
-            await stopSession()
-            showError(error)
-        }
-    }
-
-    private func stopSession() async {
-        guard state != .stopping else { return }
-        setState(.stopping)
-
-        let client = self.client
-        self.client = nil
-        client?.onDisconnect = nil
-
-        await capturer?.stop()
-        capturer?.onFrame = nil
-        encoder?.invalidate()
-        encoder?.onFrame = nil
-        await recorder?.finish()
-        client?.disconnect()
-
-        capturer = nil
-        encoder = nil
-        recorder = nil
-        display = nil // removes the virtual display
-        setState(.idle)
-    }
-
-    /// The TV went away (or capture failed) without the user asking.
-    private func connectionEnded(_ reason: String) {
-        guard client != nil, state != .stopping else { return }
-        lastMessage = reason
-        Task { await stopSession() }
-    }
-
-    private func showError(_ error: Error) {
+    private func showError(_ error: Error, title: String = "TV Extend couldn't connect") {
         let alert = NSAlert()
-        alert.messageText = "TV Extend couldn't connect"
+        alert.messageText = title
         var text = error.localizedDescription
-        if error is StreamError == false {
+        if !(error is StreamError) && title == "TV Extend couldn't connect" {
             text += "\n\nIf this is the first run, allow TV Extend under System Settings → Privacy & Security → "
                 + "Screen & System Audio Recording, then quit and reopen the app."
         }
@@ -287,7 +487,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statsTimer = nil
 
         if case .streaming = newState {
-            lastBytesSent = 0
+            lastBytesSent = client?.bytesSent ?? 0
             bitrateMbps = 0
             statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 Task { @MainActor in self?.refreshStats() }
@@ -305,11 +505,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateIcon() {
-        let streaming: Bool = { if case .streaming = state { return true } else { return false } }()
-        statusItem.button?.image = NSImage(
-            systemSymbolName: streaming ? "tv.fill" : "tv",
-            accessibilityDescription: "TV Extend"
-        )
+        let symbol: String = switch state {
+        case .streaming: "tv.fill"
+        case .reconnecting: "tv.badge.wifi"
+        default: "tv"
+        }
+        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "TV Extend")
+            ?? NSImage(systemSymbolName: "tv", accessibilityDescription: "TV Extend")
         statusItem.button?.toolTip = statusText()
     }
 }

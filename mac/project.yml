@@ -24,6 +24,7 @@ targets:
         LSUIElement: false # show a Dock icon too (right-click it for the controls)
         NSScreenCaptureUsageDescription: TV Extend captures its virtual display to stream it to your TV.
         NSLocalNetworkUsageDescription: TV Extend streams the virtual display to your TV on the local network.
+        NSBonjourServices: [_tvextend._tcp] # required to browse for TVs under Local Network privacy
     # Signing comes from Config/Signing.xcconfig (+ your gitignored Config/Local.xcconfig).
     configFiles:
       Debug: Config/Signing.xcconfig
