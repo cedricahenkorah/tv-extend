@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TV Extend</string>
+    <string name="waiting">Waiting for your Mac…</string>
+    <string name="hint">Open TV Extend on your Mac and connect to this address.</string>
+</resources>
