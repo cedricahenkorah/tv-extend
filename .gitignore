@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Xcode
+mac/*.xcodeproj/
+mac/build/
+DerivedData/
+xcuserdata/
+*.h264
+
+# Android / Gradle
+tv/.gradle/
+tv/build/
+tv/app/build/
+tv/local.properties
+tv/.idea/
+*.apk
+*.iml
+.kotlin/
+
+# Personal signing settings (team ID)
+mac/Config/Local.xcconfig
