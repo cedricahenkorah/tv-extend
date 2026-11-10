@@ -20,6 +20,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StreamServer.Listener {
     private lateinit var address: TextView
     private lateinit var detail: TextView
     private var server: StreamServer? = null
+    private var advertiser: ServiceAdvertiser? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,12 +43,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback, StreamServer.Listener {
     // MARK: Surface lifecycle — the server runs only while there's a surface to draw on.
 
     override fun surfaceCreated(holder: SurfaceHolder) {
-        server = StreamServer(holder.surface, deviceName(), this).also { it.start() }
+        val name = deviceName()
+        server = StreamServer(holder.surface, name, this).also { it.start() }
+        advertiser = ServiceAdvertiser(this, name).also { it.start() }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) = Unit
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        advertiser?.stop()
+        advertiser = null
         server?.stop()
         server = null
     }

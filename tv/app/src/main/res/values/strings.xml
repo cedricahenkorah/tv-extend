@@ -2,5 +2,5 @@
 <resources>
     <string name="app_name">TV Extend</string>
     <string name="waiting">Waiting for your Mac…</string>
-    <string name="hint">Open TV Extend on your Mac and connect to this address.</string>
+    <string name="hint">In TV Extend on your Mac, choose this TV from the menu, or connect to the address above.</string>
 </resources>
