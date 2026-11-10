@@ -1,0 +1,8 @@
+// Code signing. Committed defaults sign "to run locally" (ad hoc), which works for anyone.
+// Your personal settings go in Local.xcconfig (gitignored): copy Local.xcconfig.example
+// and fill in your team ID to get a stable signature, so macOS keeps the app's permissions.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+
+#include? "Local.xcconfig"
