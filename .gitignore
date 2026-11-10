@@ -20,3 +20,6 @@ tv/.idea/
 
 # Personal signing settings (team ID)
 mac/Config/Local.xcconfig
+
+# Local planning notes (not tracked)
+PLAN.md
